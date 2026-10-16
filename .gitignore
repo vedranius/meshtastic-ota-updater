@@ -1,0 +1,19 @@
+# Node / Wrangler build files
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+
+# Python runtime and caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Wrangler output
+_worker.bundle

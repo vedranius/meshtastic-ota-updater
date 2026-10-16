@@ -1,0 +1,14 @@
+Meshtastic ESP32-S3 Wi-Fi OTA loader repair image
+
+Built from the Meshtastic esp32-unified-ota source at commit 02e63d91bf1398b3090edf9acf589023e3969fee.
+The source archive for this exact source tree is ota-loader-source-02e63d9.zip.
+Upstream project license: GPL-3.0; see LICENSE in the source archive.
+
+Artifact: mt-esp32s3-ota-fixed-02e63d9.bin
+Target compatibility: official Meshtastic ESP32-S3 firmware targets that include mt-esp32s3-ota.bin in an app1/ota_1 partition at least 636,496 bytes large
+Flash destination: the selected target manifest app1 offset after app0/app1 non-overlap and flash-range checks (board-specific; Heltec V3 is 0x340000; Heltec V4 is 0x650000)
+Image bytes: 636496
+SHA-256: 599369c8971dbb060b489f2b0ffd5af73bd2f5ca98946f855aad807dc70fe7a9
+
+Build: PlatformIO environment esp32s3, ESP-IDF 5.5.0, ESP-IDF-supported Xtensa GCC 14.2.0_20241119.
+This is a reproducible local build of the upstream fix commit; it is not an official Meshtastic tagged OTA release.
