@@ -155,6 +155,22 @@ class OperationTests(unittest.TestCase):
                 worker.join(4)
             self.assertEqual(result[0][0], 200)
 
+    def test_previous_app_recovery_refuses_without_explicit_rom_mode(self):
+        request = Request(
+            self.base + "/api/usb/ota-recovery/restore",
+            data=json.dumps({"port": "/dev/ttyACM0", "manual_boot": False}).encode(),
+            headers={"Origin": agent.DEFAULT_ORIGIN, "Content-Type": "application/json"},
+        )
+        with patch.object(agent, "recover_esp32s3_previous_app") as recover:
+            try:
+                response = urlopen(request, timeout=4)
+            except HTTPError as error:
+                response = error
+            with response:
+                self.assertEqual(response.status, 400)
+                self.assertIn("ROM download mode", json.load(response)["error"])
+            recover.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.7"
+VERSION = "0.4.8"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 DEVICE_OPERATIONS = {}
@@ -859,30 +859,138 @@ def run_esptool_read(port, offset, length, destination, manual_boot=False):
 
 def esp32s3_ota1_geometry(partition_table):
     """Parse the standard ESP-IDF partition table and return safe OTA app geometry."""
+    app0, app1, _otadata = esp32s3_recovery_geometry(partition_table)
+    return app0, app1
+
+
+def esp32s3_recovery_geometry(partition_table):
+    """Return only the known-safe Meshtastic S3 app0/app1/otadata layout."""
     if len(partition_table) != 0x1000:
         raise ValueError("Could not read the ESP32 partition table from USB flash.")
     partitions = []
+    table_digest = hashlib.md5()
+    terminal_found = False
     for position in range(0, len(partition_table), 32):
         entry = partition_table[position:position + 32]
+        if entry == b"\xff" * 32:
+            terminal_found = True
+            break
         magic = int.from_bytes(entry[0:2], "little")
-        if magic in (0xFFFF, 0xEBEB):
+        if magic == 0xEBEB:
+            if entry[2:16] != b"\xff" * 14 or not hmac.compare_digest(entry[16:32], table_digest.digest()):
+                raise ValueError("The device partition-table checksum is invalid; no flash was changed.")
+            terminal_found = True
             break
         if magic != 0x50AA:
-            continue
+            raise ValueError("The device partition table contains an invalid entry; no flash was changed.")
         ptype, subtype = entry[2], entry[3]
         offset = int.from_bytes(entry[4:8], "little")
         size = int.from_bytes(entry[8:12], "little")
         label = entry[12:28].split(b"\0", 1)[0].decode("ascii", "replace")
         partitions.append({"type": ptype, "subtype": subtype, "offset": offset, "size": size, "label": label})
-    app0 = next((p for p in partitions if p["type"] == 0 and p["subtype"] == 0x10), None)
-    app1 = next((p for p in partitions if p["type"] == 0 and p["subtype"] == 0x11), None)
-    if not app0 or not app1:
-        raise ValueError("This device's partition table has no app0/app1 OTA application pair; no loader was changed.")
+        table_digest.update(entry)
+    if not terminal_found:
+        raise ValueError("The device partition table has no valid end marker or checksum; no flash was changed.")
+    app0s = [p for p in partitions if p["type"] == 0 and p["subtype"] == 0x10]
+    app1s = [p for p in partitions if p["type"] == 0 and p["subtype"] == 0x11]
+    otadatas = [p for p in partitions if p["type"] == 1 and p["subtype"] == 0]
+    app0 = app0s[0] if len(app0s) == 1 else None
+    app1 = app1s[0] if len(app1s) == 1 else None
+    otadata = otadatas[0] if len(otadatas) == 1 else None
+    if not app0 or not app1 or not otadata:
+        raise ValueError("This device's partition table lacks the app0/app1 OTA pair or OTA selection partition; no flash was changed.")
     if (app0["offset"] != 0x10000 or app0["size"] <= 0 or app1["offset"] < app0["offset"] + app0["size"]
             or app1["offset"] % 0x10000 or app1["size"] < ESP32S3_OTA_LOADER_SIZE
             or app1["size"] > ESP32S3_MAX_FLASH_SIZE or app1["offset"] + app1["size"] > ESP32S3_MAX_FLASH_SIZE):
-        raise ValueError("The device's app1 partition is not a supported safe destination; no loader was changed.")
-    return app0, app1
+        raise ValueError("The device's app1 partition is not a supported safe destination; no flash was changed.")
+    if (otadata["offset"] != 0xE000 or otadata["size"] != 0x2000
+            or otadata["offset"] % 0x1000 or app0["size"] % 0x10000
+            or app0["offset"] + app0["size"] > app1["offset"]):
+        raise ValueError("This is not the supported Meshtastic ESP32-S3 OTA layout; no flash was changed.")
+    ranges = sorted((p["offset"], p["offset"] + p["size"], p["label"]) for p in partitions)
+    if any(start < 0 or end <= start or end > ESP32S3_MAX_FLASH_SIZE for start, end, _ in ranges):
+        raise ValueError("The device partition table contains out-of-range partitions; no flash was changed.")
+    if any(ranges[i][1] > ranges[i + 1][0] for i in range(len(ranges) - 1)):
+        raise ValueError("The device partition table contains overlapping OTA partitions; no flash was changed.")
+    return app0, app1, otadata
+
+
+def inspect_esp32s3_previous_app_recovery(port):
+    """Read-only safety checks for returning a stuck unified loader to app0."""
+    try:
+        import esptool  # noqa: F401
+        from importlib.metadata import version as package_version
+        if int(package_version("esptool").split(".")[0]) < 5:
+            raise RuntimeError("USB recovery requires esptool 5 or newer. Restart the updated companion to install it.")
+    except ImportError as error:
+        raise RuntimeError("USB recovery requires esptool 5 or newer. Restart the updated companion to install it.") from error
+    verify_esp32s3_security_state(port, manual_boot=True)
+    with tempfile.TemporaryDirectory(prefix="meshtastic-ota-recovery-check-") as workdir:
+        table_path = os.path.join(workdir, "partition-table.bin")
+        run_esptool_read(port, 0x8000, 0x1000, table_path, manual_boot=True)
+        with open(table_path, "rb") as source:
+            app0, app1, otadata = esp32s3_recovery_geometry(source.read())
+        app0_header_path = os.path.join(workdir, "app0-header.bin")
+        run_esptool_read(port, app0["offset"], 0x1000, app0_header_path, manual_boot=True)
+        with open(app0_header_path, "rb") as source:
+            app0_header = source.read()
+        if len(app0_header) != 0x1000 or app0_header[0] != 0xE9:
+            raise ValueError("The existing app0 does not contain an ESP application header; recovery stopped without changing flash.")
+        ota_path = os.path.join(workdir, "otadata.bin")
+        run_esptool_read(port, otadata["offset"], otadata["size"], ota_path, manual_boot=True)
+        with open(ota_path, "rb") as source:
+            ota_bytes = source.read()
+    if len(ota_bytes) != otadata["size"]:
+        raise ValueError("Could not read the full OTA selection partition; no flash was changed.")
+    blank = all(byte == 0xFF for byte in ota_bytes)
+    return {
+        "port": port,
+        "architecture": "esp32-s3",
+        "manualBootRequired": True,
+        "recoverySafe": not blank,
+        "alreadyDefaultBootSelection": blank,
+        "app0": {"offset": hex(app0["offset"]), "size": hex(app0["size"]), "headerValid": True},
+        "app1": {"offset": hex(app1["offset"]), "size": hex(app1["size"])},
+        "otadata": {"offset": hex(otadata["offset"]), "size": hex(otadata["size"])},
+        "otadataSha256": hashlib.sha256(ota_bytes).hexdigest(),
+    }
+
+
+def recover_esp32s3_previous_app(port, expected_otadata_sha256):
+    """Erase only OTA boot-selection metadata so ROM chooses the existing ota_0 app."""
+    if port not in {item["path"] for item in list_serial_ports()}:
+        raise ValueError("That USB port is not currently available. Refresh the USB device list.")
+    status = inspect_esp32s3_previous_app_recovery(port)
+    if not status["recoverySafe"]:
+        raise ValueError("OTA selection is already blank and the ROM will use app0. Nothing was changed.")
+    if not hmac.compare_digest(status["otadataSha256"], str(expected_otadata_sha256 or "")):
+        raise ValueError("The OTA selection changed since it was checked. Check recovery again before proceeding.")
+    command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
+               "--before", "no-reset", "--after", "no-reset", "--no-stub", "erase-region",
+               status["otadata"]["offset"], status["otadata"]["size"]]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("USB recovery timed out while erasing only the OTA selection metadata. Re-check the device before any retry.") from error
+    except OSError as error:
+        raise RuntimeError("Could not start esptool: " + str(error)) from error
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode:
+        raise RuntimeError("Could not clear the OTA boot selection. No firmware partition was targeted. " + output[-3000:])
+    with tempfile.TemporaryDirectory(prefix="meshtastic-ota-recovery-verify-") as workdir:
+        verify_path = os.path.join(workdir, "otadata-after.bin")
+        run_esptool_read(port, int(status["otadata"]["offset"], 16), int(status["otadata"]["size"], 16), verify_path, manual_boot=True)
+        with open(verify_path, "rb") as source:
+            erased = source.read()
+    if len(erased) != int(status["otadata"]["size"], 16) or not all(byte == 0xFF for byte in erased):
+        raise RuntimeError("OTA selection erase could not be verified. app0 and NVS were not targeted; leave the board in ROM mode and inspect it over USB.")
+    return {
+        "ok": True,
+        "message": "Recovery verified. Only the OTA boot-selection partition was erased; app0 firmware and NVS/settings were not written. Press RESET to boot the previous app0 firmware.",
+        "app0": status["app0"],
+        "otadata": status["otadata"],
+        "output": output[-3000:],
+    }
 
 
 def inspect_esp32s3_ota_loader(port, manual_boot=False):
@@ -1237,6 +1345,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(409, {"error": str(error), "code": "device_busy"})
             except (ValueError, RuntimeError) as error:
                 self.send_json(400, {"error": str(error)})
+        elif route.path == "/api/usb/ota-recovery/status":
+            try:
+                port = parse_qs(route.query).get("port", [""])[0]
+                with device_operation("usb", port, "checking previous-firmware recovery"):
+                    status = inspect_esp32s3_previous_app_recovery(port)
+                self.send_json(200, status)
+            except DeviceBusyError as error:
+                self.send_json(409, {"error": str(error), "code": "device_busy"})
+            except (ValueError, RuntimeError) as error:
+                self.send_json(400, {"error": str(error)})
         elif route.path == "/api/bluetooth/scan":
             try:
                 self.send_json(200, {"devices": scan_bluetooth()})
@@ -1311,6 +1429,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     except Exception as error:
                         results.append({"target": address, "transport": transport, "ok": False, "error": str(error)})
                 self.send_json(200, {"results": results})
+                return
+            if self.path == "/api/usb/ota-recovery/restore":
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 16 * 1024:
+                    raise ValueError("Recovery request is empty or too large.")
+                request = json.loads(self.rfile.read(length).decode("utf-8"))
+                port = str(request.get("port", ""))
+                if request.get("manual_boot") is not True:
+                    raise ValueError("Put the ESP32-S3 into ROM download mode before recovery.")
+                with device_operation("usb", port, "restoring previous firmware boot selection"):
+                    result = recover_esp32s3_previous_app(port, request.get("expected_otadata_sha256", ""))
+                self.send_json(200, result)
                 return
             fields = self.parse_form()
             filename, blob = fields.get("firmware", ("", b""))
