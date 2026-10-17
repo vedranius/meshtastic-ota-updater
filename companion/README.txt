@@ -60,13 +60,13 @@ je već popravljen i ništa se ne zapisuje. Ako se točan hash ne podudara, alat
 predloži popravak. Nakon izričite potvrde, agent ponovno pročita partition
 tablicu i zapisuje loader samo u stvarnu app1 particiju tog uređaja. Provjerava
 app0/app1 tip, subtype, veličine, nepreklapanje, granice flasha i SHA-256 slike. Ako Secure Boot/flash encryption nije potvrđeno isključen, odbija automatski upis.
-Glavni firmware app0 i postavke ostaju netaknuti. Drugi serijski programi moraju
+Ako Heltec Wireless Tracker ne uđe automatski u download način, aplikacija prikazuje službeni redoslijed USER/RESET i omogućuje ponovnu provjeru u ROM načinu bez resetiranja između provjera. Glavni firmware app0 i postavke ostaju netaknuti. Drugi serijski programi moraju
 biti zatvoreni. Binarij je lokalno kompajliran iz Meshtastic esp32-unified-ota
 commita 02e63d9; nije službeno označeno izdanje. Opće firmware flashanje preko
 USB-a/Bluetootha nije podržano.
 
 
-Update note: use companion agent v0.3.9 or newer. It adds USB identity and partition/loader inspection for the standalone repair, fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
+Update note: use companion agent v0.4.0 or newer. It adds USB identity and partition/loader inspection for the standalone repair, fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
 If an ESP32-S3 node closes the TCP/3232 connection after the image header and
 reboots, its older Wi-Fi OTA loader may need a one-time USB update before OTA
 can work again. Do not repeatedly retry if the agent reports a loader reset.

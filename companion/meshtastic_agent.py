@@ -23,7 +23,8 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.3.9"
+VERSION = "0.4.0"
+USB_IDENTITY_CACHE = {}
 MAX_REQUEST = 120 * 1024 * 1024
 MAX_IMAGE = 24 * 1024 * 1024
 ESP32S3_OTA_LOADER_SIZE = 636_496
@@ -612,7 +613,7 @@ def usb_meshtastic_identity(port, timeout=12):
         hardware = user.get("hwModel") or user.get("hw_model") or ""
         if not hardware:
             raise RuntimeError("A Meshtastic device was not identified on this USB port. Check that it has booted into Meshtastic firmware and close other serial programs.")
-        return {
+        identity = {
             "port": port,
             "name": user.get("longName") or user.get("long_name") or "",
             "shortName": user.get("shortName") or user.get("short_name") or "",
@@ -620,6 +621,11 @@ def usb_meshtastic_identity(port, timeout=12):
             "firmware": str(firmware or ""),
             "verified": True,
         }
+        port_info = next((item for item in list_serial_ports() if item["path"] == port), None)
+        if port_info:
+            for key in usb_hwid_identities(port_info["hwid"]):
+                USB_IDENTITY_CACHE[key] = (time.monotonic(), identity)
+        return identity
     except (OSError, TimeoutError) as error:
         raise RuntimeError("Could not read Meshtastic identity over USB: " + str(error)) from error
     finally:
@@ -630,12 +636,42 @@ def usb_meshtastic_identity(port, timeout=12):
                 pass
 
 
-def verify_esp32s3_security_state(port):
+def cached_usb_identity(port):
+    """Reuse a recently identified node when it has been manually put in ROM download mode."""
+    current = next((item for item in list_serial_ports() if item["path"] == port), None)
+    if not current:
+        raise ValueError("The USB port disappeared. Return the node to Meshtastic mode and scan USB again.")
+    now = time.monotonic()
+    current_keys = set(usb_hwid_identities(current["hwid"]))
+    for key, (timestamp, identity) in list(USB_IDENTITY_CACHE.items()):
+        if now - timestamp > 600:
+            USB_IDENTITY_CACHE.pop(key, None)
+            continue
+        if key and key in current_keys:
+            return {**identity, "port": port}
+    raise RuntimeError("Identify the Meshtastic device while it is running normally first, then enter ROM download mode and retry.")
+
+
+def usb_hwid_identities(hwid):
+    """Return stable USB serial/location identifiers across ROM-mode re-enumeration."""
+    identities = []
+    for label in ("SER", "LOCATION"):
+        match = re.search(r"(?:^|\s)" + label + r"=([^\s]+)", hwid or "", re.IGNORECASE)
+        if match and match.group(1).lower() not in ("n/a", "none"):
+            identities.append(label + ":" + match.group(1).lower())
+    if not identities and hwid and hwid.lower() != "n/a":
+        identities.append("HWID:" + hwid.strip().lower())
+    return identities
+
+
+def verify_esp32s3_security_state(port, manual_boot=False):
     """Refuse a generic repair unless ROM confirms secure boot and encryption are disabled."""
     if port not in {item["path"] for item in list_serial_ports()}:
         raise ValueError("That USB port is not currently available. Refresh the USB device list.")
-    command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
-               "--no-stub", "get-security-info"]
+    command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port]
+    if manual_boot:
+        command += ["--before", "no-reset", "--after", "no-reset"]
+    command += ["--no-stub", "get-security-info"]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
     except subprocess.TimeoutExpired as error:
@@ -653,11 +689,13 @@ def verify_esp32s3_security_state(port):
         raise RuntimeError("Secure Boot or flash encryption is enabled. This generic loader image cannot be safely written to that protected device.")
 
 
-def run_esptool_read(port, offset, length, destination):
+def run_esptool_read(port, offset, length, destination, manual_boot=False):
     if port not in {item["path"] for item in list_serial_ports()}:
         raise ValueError("That USB port is not currently available. Refresh the USB device list.")
-    command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
-               "--baud", "460800", "read-flash", hex(offset), hex(length), destination]
+    command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port]
+    if manual_boot:
+        command += ["--before", "no-reset", "--after", "no-reset"]
+    command += ["--baud", "460800", "read-flash", hex(offset), hex(length), destination]
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
     except subprocess.TimeoutExpired as error:
@@ -697,9 +735,9 @@ def esp32s3_ota1_geometry(partition_table):
     return app0, app1
 
 
-def inspect_esp32s3_ota_loader(port):
+def inspect_esp32s3_ota_loader(port, manual_boot=False):
     """Identify a node over Meshtastic USB, then read its partition and installed loader."""
-    identity = usb_meshtastic_identity(port)
+    identity = cached_usb_identity(port) if manual_boot else usb_meshtastic_identity(port)
     try:
         import esptool  # noqa: F401
         from importlib.metadata import version as package_version
@@ -707,14 +745,14 @@ def inspect_esp32s3_ota_loader(port):
             raise RuntimeError("USB inspection requires esptool 5 or newer. Restart the updated companion to install it.")
     except ImportError as error:
         raise RuntimeError("USB inspection requires esptool 5 or newer. Restart the updated companion to install it.") from error
-    verify_esp32s3_security_state(port)
+    verify_esp32s3_security_state(port, manual_boot)
     with tempfile.TemporaryDirectory(prefix="meshtastic-loader-check-") as workdir:
         table_path = os.path.join(workdir, "partition-table.bin")
-        run_esptool_read(port, 0x8000, 0x1000, table_path)
+        run_esptool_read(port, 0x8000, 0x1000, table_path, manual_boot)
         with open(table_path, "rb") as source:
             app0, app1 = esp32s3_ota1_geometry(source.read())
         loader_path = os.path.join(workdir, "installed-loader.bin")
-        run_esptool_read(port, app1["offset"], ESP32S3_OTA_LOADER_SIZE, loader_path)
+        run_esptool_read(port, app1["offset"], ESP32S3_OTA_LOADER_SIZE, loader_path, manual_boot)
         with open(loader_path, "rb") as source:
             installed_hash = hashlib.sha256(source.read()).hexdigest()
     patched = installed_hash == ESP32S3_OTA_LOADER_SHA256
@@ -726,14 +764,15 @@ def inspect_esp32s3_ota_loader(port):
         "loaderSha256": installed_hash,
         "patchedLoaderInstalled": patched,
         "recommendRepair": not patched,
+        "manualBoot": manual_boot,
     }
 
 
-def repair_esp32s3_ota_loader(port, blob):
+def repair_esp32s3_ota_loader(port, blob, manual_boot=False):
     """Write the verified S3 loader to app1 geometry read directly from this device."""
     if len(blob) != ESP32S3_OTA_LOADER_SIZE or hashlib.sha256(blob).hexdigest() != ESP32S3_OTA_LOADER_SHA256:
         raise ValueError("OTA loader image failed its size or SHA-256 check.")
-    identity = usb_meshtastic_identity(port)
+    identity = cached_usb_identity(port) if manual_boot else usb_meshtastic_identity(port)
     try:
         import esptool  # noqa: F401
         from importlib.metadata import version as package_version
@@ -741,18 +780,20 @@ def repair_esp32s3_ota_loader(port, blob):
             raise RuntimeError("USB loader repair requires esptool 5 or newer. Restart the updated companion to install it.")
     except ImportError as error:
         raise RuntimeError("USB loader repair requires esptool 5 or newer. Restart the updated companion to install it.") from error
-    verify_esp32s3_security_state(port)
+    verify_esp32s3_security_state(port, manual_boot)
 
     with tempfile.TemporaryDirectory(prefix="meshtastic-ota-loader-") as workdir:
         table_path = os.path.join(workdir, "partition-table.bin")
-        run_esptool_read(port, 0x8000, 0x1000, table_path)
+        run_esptool_read(port, 0x8000, 0x1000, table_path, manual_boot)
         with open(table_path, "rb") as source:
             app0, app1 = esp32s3_ota1_geometry(source.read())
         image_path = os.path.join(workdir, "patched-loader.bin")
         with open(image_path, "wb") as image:
             image.write(blob)
-        command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
-                   "--baud", "460800", "write-flash", "--flash-mode", "keep", "--flash-size", "keep",
+        command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port]
+        if manual_boot:
+            command += ["--before", "no-reset"]
+        command += ["--baud", "460800", "write-flash", "--flash-mode", "keep", "--flash-size", "keep",
                    hex(app1["offset"]), image_path]
         try:
             result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
@@ -1010,7 +1051,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif route.path == "/api/usb/ota-loader/status":
             try:
                 port = parse_qs(route.query).get("port", [""])[0]
-                self.send_json(200, inspect_esp32s3_ota_loader(port))
+                manual_boot = parse_qs(route.query).get("manual", [""])[0] == "1"
+                self.send_json(200, inspect_esp32s3_ota_loader(port, manual_boot))
             except (ValueError, RuntimeError) as error:
                 self.send_json(400, {"error": str(error)})
         elif route.path == "/api/bluetooth/scan":
@@ -1087,7 +1129,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fields = self.parse_form()
             filename, blob = fields.get("firmware", ("", b""))
             if self.path == "/api/usb/repair-ota-loader":
-                result = repair_esp32s3_ota_loader(fields.get("port", ""), blob)
+                result = repair_esp32s3_ota_loader(fields.get("port", ""), blob, fields.get("manual_boot") == "1")
                 self.send_json(200, result)
                 return
             if self.path == "/api/firmware/options":
