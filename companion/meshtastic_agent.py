@@ -24,7 +24,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 MAX_REQUEST = 120 * 1024 * 1024
@@ -231,29 +231,29 @@ def legacy_ota_upload(target, data, password, filename):
         udp.close()
 
 
-def unified_ota_upload(target, data):
+def unified_ota_upload(target, data, iface=None):
     """Use Meshtastic's Admin OTA request and unified TCP/3232 updater."""
     from meshtastic import ota
     from meshtastic.protobuf import admin_pb2
     from meshtastic.tcp_interface import TCPInterface
 
     image_path = None
-    iface = None
     stage = "preparing the OTA request"
     try:
         with tempfile.NamedTemporaryFile(prefix="meshtastic-ota-", suffix=".bin", delete=False) as image:
             image.write(data)
             image_path = image.name
         updater = ota.ESP32WiFiOTA(image_path, target)
-        stage = "opening a bounded Meshtastic TCP/4403 session"
-        iface = TCPInterface(
-            hostname=target,
-            portNumber=4403,
-            timeout=15,
-            noNodes=True,
-            connectNow=False,
-        )
-        iface.connect()
+        if iface is None:
+            stage = "opening a bounded Meshtastic TCP/4403 session"
+            iface = TCPInterface(
+                hostname=target,
+                portNumber=4403,
+                timeout=15,
+                noNodes=True,
+                connectNow=False,
+            )
+            iface.connect()
         stage = "sending the Wi-Fi OTA reboot request over TCP/4403"
         iface.localNode.startOTA(
             ota_mode=admin_pb2.OTAMode.OTA_WIFI,
@@ -279,6 +279,12 @@ def unified_ota_upload(target, data):
                     "On ESP32-S3 boards this can indicate the older OTA Loader v1.0.1 stack-overflow bug; "
                     "the loader may need a one-time USB update. The node rebooted back to normal firmware; "
                     "do not repeat the OTA attempt until the loader is updated."
+                ) from error
+            except TimeoutError as error:
+                raise RuntimeError(
+                    "The node accepted the OTA reboot request, but the Wi-Fi OTA service did not answer on TCP/3232 in time. "
+                    "The image transfer could not be confirmed. Do not retry until the node is back online; on ESP32-S3, "
+                    "check the OTA loader over USB before another Wi-Fi update."
                 ) from error
             except Exception as error:
                 # Only retry when the OTA service is not reachable yet. Once a
@@ -323,13 +329,16 @@ def unified_ota_upload(target, data):
 
 def ota_upload(target, data, password, filename):
     target = private_ipv4(target)
-    identity = identify_meshtastic(target)
+    iface = open_identified_meshtastic(target, timeout=10, wait_config=True)
+    identity = identify_connected(iface)
     version = re.match(r"^(\d+)\.(\d+)\.(\d+)", identity.get("firmware", ""))
     if not version:
+        iface.close()
         raise RuntimeError("Could not read the installed firmware version over TCP/4403, so I cannot choose the correct OTA protocol.")
     installed = tuple(int(part) for part in version.groups())
     if installed >= (2, 7, 18):
-        return unified_ota_upload(target, data)
+        return unified_ota_upload(target, data, iface=iface)
+    iface.close()
     return legacy_ota_upload(target, data, password, filename)
 
 
@@ -544,75 +553,57 @@ def discover_meshtastic(interface_ip, timeout=2.5):
 
 def identify_meshtastic(target, timeout=10):
     """Read the node's own hardware/name/firmware metadata over Meshtastic TCP."""
+    iface = open_identified_meshtastic(target, timeout)
+    try:
+        identity = identify_connected(iface)
+        identity["ip"] = private_ipv4(target)
+        identity["verified"] = bool(identity.get("hardware"))
+        return identity
+    finally:
+        try:
+            iface.close()
+        except Exception:
+            pass
+
+
+def open_identified_meshtastic(target, timeout=10, wait_config=False):
+    """Open one bounded TCP session and wait for local identity metadata."""
     target = private_ipv4(target)
     try:
         from meshtastic.tcp_interface import TCPInterface
-    except ImportError:
-        raise RuntimeError("Meshtastic agent setup is incomplete. Restart it so it can install the Meshtastic Python library.")
-    iface = None
+    except ImportError as error:
+        raise RuntimeError("Meshtastic agent setup is incomplete. Restart it so it can install the Meshtastic Python library.") from error
+    iface = TCPInterface(
+        hostname=target,
+        portNumber=4403,
+        timeout=timeout,
+        noNodes=True,
+        connectNow=False,
+    )
     try:
-        # TCPInterface defaults to a 300 second handshake timeout. Pass our
-        # bounded timeout through to the official library, and skip the node
-        # database: discovery only needs the local node's user + metadata.
-        # Avoid a separate probe socket; opening and immediately dropping a
-        # second TCP session can upset devices that only allow one client.
-        iface = TCPInterface(
-            hostname=target,
-            portNumber=4403,
-            timeout=timeout,
-            noNodes=True,
-            connectNow=False,
-        )
         iface.connect()
         deadline = time.monotonic() + timeout
-        user = None
-        metadata = None
         while time.monotonic() < deadline:
             user = iface.getMyUser()
             metadata = getattr(iface, "metadata", None)
             if user or metadata:
-                break
+                if wait_config:
+                    wait_for_device_config(iface.localNode, timeout=timeout)
+                return iface
             time.sleep(0.1)
-        user = user or {}
-        metadata = metadata or {}
-        hw_model = user.get("hwModel") or user.get("hw_model")
-        if not hw_model and not user and not metadata:
-            raise RuntimeError("The TCP port answered, but the node did not provide identity metadata. Enable Meshtastic TCP on this device or choose its board manually.")
-        if hasattr(metadata, "firmware_version"):
-            firmware = metadata.firmware_version
-        elif isinstance(metadata, dict):
-            firmware = metadata.get("firmwareVersion") or metadata.get("firmware_version") or ""
-        else:
-            firmware = ""
-        return {
-            "ip": target,
-            "name": user.get("longName") or user.get("long_name") or "",
-            "shortName": user.get("shortName") or user.get("short_name") or "",
-            "hardware": str(hw_model or ""),
-            "firmware": str(firmware or ""),
-            "verified": bool(hw_model),
-        }
-    except (OSError, TimeoutError) as error:
-        raise RuntimeError(f"Could not read Meshtastic identity over TCP port 4403. Confirm the selected IP, same LAN, and that TCP access is enabled: {error}") from error
+        raise RuntimeError("The TCP port answered, but the node did not provide identity metadata. Enable Meshtastic TCP on this device or choose its board manually.")
     except Exception as error:
-        # The Meshtastic library raises MeshInterfaceError (not TimeoutError)
-        # when the TCP socket opens but the radio never completes its protocol
-        # handshake. Keep that normal device/network failure inside the API
-        # response instead of terminating the HTTP handler with a traceback.
+        try:
+            iface.close()
+        except Exception:
+            pass
         detail = str(error).strip() or error.__class__.__name__
         if "timed out waiting for connection completion" in detail.lower():
             raise RuntimeError(
                 f"TCP/4403 is reachable at {target}, but the node did not finish the Meshtastic handshake within {timeout} seconds. "
-                "Close any other Meshtastic app or TCP client connected to this node, confirm TCP access is enabled, then retry. "
-                "You can still select its board manually from the official catalog."
+                "Close other Meshtastic apps or clients connected to this node, confirm TCP access is enabled, then retry."
             ) from error
-        raise RuntimeError(f"Meshtastic identity read failed for {target} over TCP/4403: {detail}") from error
-    finally:
-        if iface is not None:
-            try:
-                iface.close()
-            except Exception:
-                pass
+        raise RuntimeError(f"Could not open a Meshtastic TCP/4403 session with {target}: {detail}") from error
 
 
 def list_serial_ports():
