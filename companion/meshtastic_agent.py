@@ -23,7 +23,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 MAX_REQUEST = 120 * 1024 * 1024
 MAX_IMAGE = 24 * 1024 * 1024
 ESP32S3_OTA_LOADER_SIZE = 636_496
@@ -564,61 +564,188 @@ def list_serial_ports():
     return [{"path": p.device, "name": p.description or p.device, "hwid": p.hwid or ""} for p in list_ports.comports()]
 
 
-def repair_esp32s3_ota_loader(port, blob, board, architecture, offset, partition_size, partition_name, partition_type, partition_subtype, image_name, app0_offset, app0_size):
-    """Write the patched S3 loader only to the app1 partition from an official target manifest."""
-    if architecture != "esp32-s3" or not re.fullmatch(r"[a-z0-9_-]{1,80}", board):
-        raise ValueError("Loader repair supports official ESP32-S3 firmware targets only.")
-    try:
-        app1_offset = int(offset, 0)
-        app1_size = int(partition_size, 0)
-        app0_address = int(app0_offset, 0)
-        app0_length = int(app0_size, 0)
-    except (TypeError, ValueError):
-        raise ValueError("The selected firmware manifest has invalid app0/app1 partition geometry.")
-    if partition_name != "app1" or partition_type != "app" or partition_subtype != "ota_1":
-        raise ValueError("The selected firmware manifest does not describe a supported ESP32-S3 app1 OTA partition.")
-    if (app0_address != 0x10000 or app0_length <= 0 or app1_offset < app0_address + app0_length
-            or app1_offset % 0x10000 or app1_size < ESP32S3_OTA_LOADER_SIZE
-            or app1_size > ESP32S3_MAX_FLASH_SIZE or app1_offset + app1_size > ESP32S3_MAX_FLASH_SIZE):
-        raise ValueError("The app1 partition is too small or its manifest geometry overlaps app0 or exceeds 16 MiB flash.")
-    if image_name != "mt-esp32s3-ota.bin":
-        raise ValueError("The selected firmware manifest does not contain the ESP32-S3 OTA loader image.")
-    if len(blob) != ESP32S3_OTA_LOADER_SIZE or hashlib.sha256(blob).hexdigest() != ESP32S3_OTA_LOADER_SHA256:
-        raise ValueError("OTA loader image failed its size or SHA-256 check.")
+def usb_meshtastic_identity(port, timeout=12):
+    """Read the connected node identity over its explicitly selected USB serial port."""
     if port not in {item["path"] for item in list_serial_ports()}:
         raise ValueError("That USB port is not currently available. Refresh the USB device list.")
+    try:
+        from meshtastic.serial_interface import SerialInterface
+    except ImportError as error:
+        raise RuntimeError("USB identification requires the Meshtastic Python package. Restart the companion to install it.") from error
+    iface = None
+    try:
+        iface = SerialInterface(devPath=port)
+        deadline = time.monotonic() + timeout
+        user = None
+        metadata = None
+        while time.monotonic() < deadline:
+            user = iface.getMyUser() or {}
+            metadata = getattr(iface, "metadata", None) or {}
+            if user.get("hwModel") or user.get("hw_model"):
+                break
+            time.sleep(0.1)
+        user = user or {}
+        if hasattr(metadata, "firmware_version"):
+            firmware = metadata.firmware_version
+        elif isinstance(metadata, dict):
+            firmware = metadata.get("firmwareVersion") or metadata.get("firmware_version") or ""
+        else:
+            firmware = ""
+        hardware = user.get("hwModel") or user.get("hw_model") or ""
+        if not hardware:
+            raise RuntimeError("A Meshtastic device was not identified on this USB port. Check that it has booted into Meshtastic firmware and close other serial programs.")
+        return {
+            "port": port,
+            "name": user.get("longName") or user.get("long_name") or "",
+            "shortName": user.get("shortName") or user.get("short_name") or "",
+            "hardware": str(hardware),
+            "firmware": str(firmware or ""),
+            "verified": True,
+        }
+    except (OSError, TimeoutError) as error:
+        raise RuntimeError("Could not read Meshtastic identity over USB: " + str(error)) from error
+    finally:
+        if iface is not None:
+            try:
+                iface.close()
+            except Exception:
+                pass
 
+
+def verify_esp32s3_security_state(port):
+    """Refuse a generic repair unless ROM confirms secure boot and encryption are disabled."""
+    if port not in {item["path"] for item in list_serial_ports()}:
+        raise ValueError("That USB port is not currently available. Refresh the USB device list.")
+    command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
+               "--no-stub", "get-security-info"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Could not verify ESP32-S3 security state over USB; no flash was changed.") from error
+    except OSError as error:
+        raise RuntimeError("Could not start esptool security check: " + str(error)) from error
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode:
+        raise RuntimeError("Could not verify ESP32-S3 Secure Boot and flash-encryption state; no flash was changed. " + output[-2000:])
+    secure_boot = re.search(r"Secure Boot:\s*(Enabled|Disabled)", output, re.IGNORECASE)
+    flash_encryption = re.search(r"Flash Encryption:\s*(Enabled|Disabled)", output, re.IGNORECASE)
+    if not secure_boot or not flash_encryption:
+        raise RuntimeError("The ROM did not report Secure Boot and flash-encryption state; refusing the generic loader repair.")
+    if secure_boot.group(1).lower() != "disabled" or flash_encryption.group(1).lower() != "disabled":
+        raise RuntimeError("Secure Boot or flash encryption is enabled. This generic loader image cannot be safely written to that protected device.")
+
+
+def run_esptool_read(port, offset, length, destination):
+    if port not in {item["path"] for item in list_serial_ports()}:
+        raise ValueError("That USB port is not currently available. Refresh the USB device list.")
+    command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
+               "--baud", "460800", "read-flash", hex(offset), hex(length), destination]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=90, check=False)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("USB flash inspection timed out. Check the cable and close other serial programs.") from error
+    except OSError as error:
+        raise RuntimeError("Could not start esptool: " + str(error)) from error
+    if result.returncode:
+        output = (result.stdout + "\n" + result.stderr).strip()
+        raise RuntimeError("Could not inspect ESP32-S3 flash over USB. " + output[-3000:])
+
+
+def esp32s3_ota1_geometry(partition_table):
+    """Parse the standard ESP-IDF partition table and return safe OTA app geometry."""
+    if len(partition_table) != 0x1000:
+        raise ValueError("Could not read the ESP32 partition table from USB flash.")
+    partitions = []
+    for position in range(0, len(partition_table), 32):
+        entry = partition_table[position:position + 32]
+        magic = int.from_bytes(entry[0:2], "little")
+        if magic in (0xFFFF, 0xEBEB):
+            break
+        if magic != 0x50AA:
+            continue
+        ptype, subtype = entry[2], entry[3]
+        offset = int.from_bytes(entry[4:8], "little")
+        size = int.from_bytes(entry[8:12], "little")
+        label = entry[12:28].split(b"\0", 1)[0].decode("ascii", "replace")
+        partitions.append({"type": ptype, "subtype": subtype, "offset": offset, "size": size, "label": label})
+    app0 = next((p for p in partitions if p["type"] == 0 and p["subtype"] == 0x10), None)
+    app1 = next((p for p in partitions if p["type"] == 0 and p["subtype"] == 0x11), None)
+    if not app0 or not app1:
+        raise ValueError("This device's partition table has no app0/app1 OTA application pair; no loader was changed.")
+    if (app0["offset"] != 0x10000 or app0["size"] <= 0 or app1["offset"] < app0["offset"] + app0["size"]
+            or app1["offset"] % 0x10000 or app1["size"] < ESP32S3_OTA_LOADER_SIZE
+            or app1["size"] > ESP32S3_MAX_FLASH_SIZE or app1["offset"] + app1["size"] > ESP32S3_MAX_FLASH_SIZE):
+        raise ValueError("The device's app1 partition is not a supported safe destination; no loader was changed.")
+    return app0, app1
+
+
+def inspect_esp32s3_ota_loader(port):
+    """Identify a node over Meshtastic USB, then read its partition and installed loader."""
+    identity = usb_meshtastic_identity(port)
+    try:
+        import esptool  # noqa: F401
+        from importlib.metadata import version as package_version
+        if int(package_version("esptool").split(".")[0]) < 5:
+            raise RuntimeError("USB inspection requires esptool 5 or newer. Restart the updated companion to install it.")
+    except ImportError as error:
+        raise RuntimeError("USB inspection requires esptool 5 or newer. Restart the updated companion to install it.") from error
+    verify_esp32s3_security_state(port)
+    with tempfile.TemporaryDirectory(prefix="meshtastic-loader-check-") as workdir:
+        table_path = os.path.join(workdir, "partition-table.bin")
+        run_esptool_read(port, 0x8000, 0x1000, table_path)
+        with open(table_path, "rb") as source:
+            app0, app1 = esp32s3_ota1_geometry(source.read())
+        loader_path = os.path.join(workdir, "installed-loader.bin")
+        run_esptool_read(port, app1["offset"], ESP32S3_OTA_LOADER_SIZE, loader_path)
+        with open(loader_path, "rb") as source:
+            installed_hash = hashlib.sha256(source.read()).hexdigest()
+    patched = installed_hash == ESP32S3_OTA_LOADER_SHA256
+    return {
+        **identity,
+        "architecture": "esp32-s3",
+        "app0": {"offset": hex(app0["offset"]), "size": hex(app0["size"])},
+        "app1": {"offset": hex(app1["offset"]), "size": hex(app1["size"])},
+        "loaderSha256": installed_hash,
+        "patchedLoaderInstalled": patched,
+        "recommendRepair": not patched,
+    }
+
+
+def repair_esp32s3_ota_loader(port, blob):
+    """Write the verified S3 loader to app1 geometry read directly from this device."""
+    if len(blob) != ESP32S3_OTA_LOADER_SIZE or hashlib.sha256(blob).hexdigest() != ESP32S3_OTA_LOADER_SHA256:
+        raise ValueError("OTA loader image failed its size or SHA-256 check.")
+    identity = usb_meshtastic_identity(port)
     try:
         import esptool  # noqa: F401
         from importlib.metadata import version as package_version
         if int(package_version("esptool").split(".")[0]) < 5:
             raise RuntimeError("USB loader repair requires esptool 5 or newer. Restart the updated companion to install it.")
     except ImportError as error:
-        raise RuntimeError("USB loader repair requires esptool. Restart the updated companion so it can install the dependency.") from error
+        raise RuntimeError("USB loader repair requires esptool 5 or newer. Restart the updated companion to install it.") from error
+    verify_esp32s3_security_state(port)
 
-    with tempfile.NamedTemporaryFile(prefix="meshtastic-ota-loader-", suffix=".bin", delete=False) as image:
-        image.write(blob)
-        image_path = image.name
-    command = [
-        sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
-        "--baud", "460800", "write-flash", "--flash-mode", "keep", "--flash-size", "keep",
-        hex(app1_offset), image_path,
-    ]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise RuntimeError("USB flash timed out. Check the cable, close serial monitors, and try again.") from error
-    except OSError as error:
-        raise RuntimeError("Could not start esptool: " + str(error)) from error
-    finally:
+    with tempfile.TemporaryDirectory(prefix="meshtastic-ota-loader-") as workdir:
+        table_path = os.path.join(workdir, "partition-table.bin")
+        run_esptool_read(port, 0x8000, 0x1000, table_path)
+        with open(table_path, "rb") as source:
+            app0, app1 = esp32s3_ota1_geometry(source.read())
+        image_path = os.path.join(workdir, "patched-loader.bin")
+        with open(image_path, "wb") as image:
+            image.write(blob)
+        command = [sys.executable, "-m", "esptool", "--chip", "esp32s3", "--port", port,
+                   "--baud", "460800", "write-flash", "--flash-mode", "keep", "--flash-size", "keep",
+                   hex(app1["offset"]), image_path]
         try:
-            os.unlink(image_path)
-        except OSError:
-            pass
-    output = (result.stdout + "\n" + result.stderr).strip()
-    if result.returncode:
-        raise RuntimeError("USB loader flash failed. " + output[-6000:])
-    return {"ok": True, "message": f"Patched ESP32-S3 OTA loader written to {board} app1 at {hex(app1_offset)}. Main firmware and configuration were not erased.", "output": output[-6000:]}
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180, check=False)
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError("USB flash timed out. Check the cable, close serial monitors, and try again.") from error
+        except OSError as error:
+            raise RuntimeError("Could not start esptool: " + str(error)) from error
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if result.returncode:
+            raise RuntimeError("USB loader flash failed. " + output[-6000:])
+    return {"ok": True, "message": f"Patched ESP32-S3 OTA loader written for {identity['hardware']} to app1 at {hex(app1['offset'])}. Main firmware and configuration were not erased.", "output": output[-6000:], "identity": identity, "app0": {"offset": hex(app0["offset"]), "size": hex(app0["size"])}, "app1": {"offset": hex(app1["offset"]), "size": hex(app1["size"])}}
 
 
 def scan_bluetooth():
@@ -856,6 +983,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"devices": list_serial_ports()})
             except RuntimeError as error:
                 self.send_json(500, {"error": str(error)})
+        elif route.path == "/api/usb/identify":
+            try:
+                port = parse_qs(route.query).get("port", [""])[0]
+                self.send_json(200, usb_meshtastic_identity(port))
+            except (ValueError, RuntimeError) as error:
+                self.send_json(400, {"error": str(error)})
+        elif route.path == "/api/usb/ota-loader/status":
+            try:
+                port = parse_qs(route.query).get("port", [""])[0]
+                self.send_json(200, inspect_esp32s3_ota_loader(port))
+            except (ValueError, RuntimeError) as error:
+                self.send_json(400, {"error": str(error)})
         elif route.path == "/api/bluetooth/scan":
             try:
                 self.send_json(200, {"devices": scan_bluetooth()})
@@ -930,14 +1069,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fields = self.parse_form()
             filename, blob = fields.get("firmware", ("", b""))
             if self.path == "/api/usb/repair-ota-loader":
-                result = repair_esp32s3_ota_loader(
-                    fields.get("port", ""), blob, fields.get("board", ""),
-                    fields.get("architecture", ""), fields.get("offset", ""),
-                    fields.get("partition_size", ""), fields.get("partition_name", ""),
-                    fields.get("partition_type", ""), fields.get("partition_subtype", ""),
-                    fields.get("image_name", ""), fields.get("app0_offset", ""),
-                    fields.get("app0_size", ""),
-                )
+                result = repair_esp32s3_ota_loader(fields.get("port", ""), blob)
                 self.send_json(200, result)
                 return
             if self.path == "/api/firmware/options":

@@ -5,10 +5,12 @@ The source archive for this exact source tree is ota-loader-source-02e63d9.zip.
 Upstream project license: GPL-3.0; see LICENSE in the source archive.
 
 Artifact: mt-esp32s3-ota-fixed-02e63d9.bin
-Target compatibility: official Meshtastic ESP32-S3 firmware targets that include mt-esp32s3-ota.bin in an app1/ota_1 partition at least 636,496 bytes large
-Flash destination: the selected target manifest app1 offset after app0/app1 non-overlap and flash-range checks (board-specific; Heltec V3 is 0x340000; Heltec V4 is 0x650000)
+Target compatibility: Meshtastic ESP32-S3 boards with an ESP-IDF app0/app1 OTA partition pair and an app1/ota_1 partition at least 636,496 bytes large. The companion reads and validates the connected device partition table over USB before any write.
+Flash destination: the connected device app1 offset read directly from its partition table after app0/app1 non-overlap and flash-range checks (board-specific; Heltec V3 and Wireless Tracker V1.1 currently use 0x340000).
 Image bytes: 636496
 SHA-256: 599369c8971dbb060b489f2b0ffd5af73bd2f5ca98946f855aad807dc70fe7a9
+
+Installed-image check: compare the first 636,496 bytes read from app1 with the SHA-256 above. A different hash means this exact locally built repair image is not installed; it does not by itself prove that every other loader build is vulnerable.
 
 Build: PlatformIO environment esp32s3, ESP-IDF 5.5.0, ESP-IDF-supported Xtensa GCC 14.2.0_20241119.
 This is a reproducible local build of the upstream fix commit; it is not an official Meshtastic tagged OTA release.

@@ -2,7 +2,7 @@ Meshtastic OTA Studio — lokalni agent
 
 Potreban je Python 3.10 ili noviji. Prvo pokretanje automatski stvara privatni
 Python okoliš i instalira Meshtastic Python biblioteku i esptool 5+ za USB pristup,
-prepoznavanje uređaja te ciljanu popravku OTA loadera.
+prepoznavanje uređaja te ciljani popravak OTA loadera.
 
 Windows: dvoklik na start-windows.bat, pa zalijepite URL Pages stranice.
 Linux/macOS: pokrenite ./start-linux-macos.sh https://vas-projekt.pages.dev
@@ -44,17 +44,29 @@ uključuju PSK ključeve, a ostale postavke mogu sadržavati Wi-Fi/MQTT lozinke;
 izvezene profile čuvajte privatno. Prije grupne primjene provjerite LoRa
 regiju i frekvencijske postavke za sve uređaje.
 
-Aplikacija može preko USB-a popraviti ESP32-S3 OTA loader za službene
-Meshtastic ciljeve čiji odabrani manifest sadrži mt-esp32s3-ota.bin. Zatvori
-druge serijske programe, spoji nod USB-om i u koraku 04 odaberi port. Adresa i
-veličina app1 particije čitaju se iz manifesta točne pločice/verzije; agent
-provjerava metapodatke particije, dozvoljenu adresu, veličinu i SHA-256 prije
-upisa. app0 i postavke se ne brišu. Binarij je lokalno kompajliran iz
-Meshtastic esp32-unified-ota commita 02e63d9, nije službeno izdanje. Ostalo
-opće firmware flashanje preko USB-a/Bluetootha nije podržano.
+Samostalni USB popravak
+----------------------
+
+USB popravak je odvojen od mrežnog pretraživanja i Wi-Fi firmware koraka. Spoji
+node na računalo agenta, klikni Skeniraj USB i prepoznaj uređaj. Agent preko
+Meshtastic serial protokola očita naziv, hardware model i firmware; sučelje
+poveže model sa službenim katalogom i ne traži ručni odabir pločice ni firmware
+izdanja. Ako ima više prepoznatih nodova, odaberi po automatski očitanom modelu.
+
+Klikni Provjeri loader za čitanje ESP32-S3 partition tablice i app1 slike preko
+USB-a. Ovo čitanje kratko resetira uređaj, ali ništa ne zapisuje. Agent usporedi
+SHA-256 instaliranog loadera s ugrađenim popravkom 02e63d9. Ako je isti, uređaj
+je već popravljen i ništa se ne zapisuje. Ako se točan hash ne podudara, alat
+predloži popravak. Nakon izričite potvrde, agent ponovno pročita partition
+tablicu i zapisuje loader samo u stvarnu app1 particiju tog uređaja. Provjerava
+app0/app1 tip, subtype, veličine, nepreklapanje, granice flasha i SHA-256 slike. Ako Secure Boot/flash encryption nije potvrđeno isključen, odbija automatski upis.
+Glavni firmware app0 i postavke ostaju netaknuti. Drugi serijski programi moraju
+biti zatvoreni. Binarij je lokalno kompajliran iz Meshtastic esp32-unified-ota
+commita 02e63d9; nije službeno označeno izdanje. Opće firmware flashanje preko
+USB-a/Bluetootha nije podržano.
 
 
-Update note: use companion agent v0.3.7 or newer. It fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
+Update note: use companion agent v0.3.8 or newer. It adds USB identity and partition/loader inspection for the standalone repair, fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
 If an ESP32-S3 node closes the TCP/3232 connection after the image header and
 reboots, its older Wi-Fi OTA loader may need a one-time USB update before OTA
 can work again. Do not repeatedly retry if the agent reports a loader reset.
