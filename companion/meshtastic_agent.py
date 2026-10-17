@@ -23,7 +23,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 MAX_REQUEST = 120 * 1024 * 1024
@@ -514,7 +514,7 @@ def discover_meshtastic(interface_ip, timeout=2.5):
     return list(unique.values())
 
 
-def identify_meshtastic(target, timeout=5):
+def identify_meshtastic(target, timeout=10):
     """Read the node's own hardware/name/firmware metadata over Meshtastic TCP."""
     target = private_ipv4(target)
     try:
@@ -523,9 +523,19 @@ def identify_meshtastic(target, timeout=5):
         raise RuntimeError("Meshtastic agent setup is incomplete. Restart it so it can install the Meshtastic Python library.")
     iface = None
     try:
-        with socket.create_connection((target, 4403), timeout=timeout):
-            pass
-        iface = TCPInterface(hostname=target, portNumber=4403)
+        # TCPInterface defaults to a 300 second handshake timeout. Pass our
+        # bounded timeout through to the official library, and skip the node
+        # database: discovery only needs the local node's user + metadata.
+        # Avoid a separate probe socket; opening and immediately dropping a
+        # second TCP session can upset devices that only allow one client.
+        iface = TCPInterface(
+            hostname=target,
+            portNumber=4403,
+            timeout=timeout,
+            noNodes=True,
+            connectNow=False,
+        )
+        iface.connect()
         deadline = time.monotonic() + timeout
         user = None
         metadata = None
@@ -555,7 +565,20 @@ def identify_meshtastic(target, timeout=5):
             "verified": bool(hw_model),
         }
     except (OSError, TimeoutError) as error:
-        raise RuntimeError(f"Could not read Meshtastic identity over TCP port 4403. Confirm the selected IP, same LAN, and that TCP access is enabled: {error}")
+        raise RuntimeError(f"Could not read Meshtastic identity over TCP port 4403. Confirm the selected IP, same LAN, and that TCP access is enabled: {error}") from error
+    except Exception as error:
+        # The Meshtastic library raises MeshInterfaceError (not TimeoutError)
+        # when the TCP socket opens but the radio never completes its protocol
+        # handshake. Keep that normal device/network failure inside the API
+        # response instead of terminating the HTTP handler with a traceback.
+        detail = str(error).strip() or error.__class__.__name__
+        if "timed out waiting for connection completion" in detail.lower():
+            raise RuntimeError(
+                f"TCP/4403 is reachable at {target}, but the node did not finish the Meshtastic handshake within {timeout} seconds. "
+                "Close any other Meshtastic app or TCP client connected to this node, confirm TCP access is enabled, then retry. "
+                "You can still select its board manually from the official catalog."
+            ) from error
+        raise RuntimeError(f"Meshtastic identity read failed for {target} over TCP/4403: {detail}") from error
     finally:
         if iface is not None:
             try:
@@ -600,7 +623,8 @@ def usb_meshtastic_identity(port, timeout=12):
         raise RuntimeError("USB identification requires the Meshtastic Python package. Restart the companion to install it.") from error
     iface = None
     try:
-        iface = SerialInterface(devPath=port)
+        iface = SerialInterface(devPath=port, timeout=timeout, noNodes=True, connectNow=False)
+        iface.connect()
         deadline = time.monotonic() + timeout
         user = None
         metadata = None
@@ -635,6 +659,14 @@ def usb_meshtastic_identity(port, timeout=12):
         return identity
     except (OSError, TimeoutError) as error:
         raise RuntimeError("Could not read Meshtastic identity over USB: " + str(error)) from error
+    except Exception as error:
+        detail = str(error).strip() or error.__class__.__name__
+        if "timed out waiting for connection completion" in detail.lower():
+            raise RuntimeError(
+                f"USB port {port} opened, but the node did not finish the Meshtastic handshake within {timeout} seconds. "
+                "Make sure it has booted normally and close other serial or Meshtastic programs."
+            ) from error
+        raise RuntimeError(f"Meshtastic identity read failed on USB port {port}: {detail}") from error
     finally:
         if iface is not None:
             try:
