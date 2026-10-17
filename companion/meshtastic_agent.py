@@ -26,7 +26,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 DEVICE_OPERATIONS = {}
@@ -265,19 +265,40 @@ def legacy_ota_upload(target, data, password, filename):
         udp.close()
 
 
+def _ota_read_line(conn, timeout, phase):
+    """Read one OTA protocol line with a phase-specific deadline."""
+    deadline = time.monotonic() + timeout
+    line = bytearray()
+    while not line.endswith(b"\n"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"Timed out {phase} after {timeout} seconds")
+        conn.settimeout(remaining)
+        char = conn.recv(1)
+        if not char:
+            raise ConnectionError(f"The node closed TCP/3232 {phase}; response was {bytes(line)!r}")
+        line.extend(char)
+        if len(line) > 512:
+            raise ConnectionError(f"The node returned an overlong OTA response {phase}")
+    return line.decode("utf-8", "replace").strip()
+
+
 def unified_ota_upload(target, data, iface=None):
-    """Use Meshtastic's Admin OTA request and unified TCP/3232 updater."""
-    from meshtastic import ota
+    """Request OTA on Meshtastic TCP/4403, then stream over unified TCP/3232.
+
+    The upstream client's single 15-second socket timeout covered connection,
+    flash erase, transfer, and verification. A slow erase was therefore
+    misreported as a missing OTA service. Keep connection retries before the
+    OTA command only, then use explicit phase deadlines and never restart a
+    transfer after the device may have begun erasing/writing.
+    """
     from meshtastic.protobuf import admin_pb2
     from meshtastic.tcp_interface import TCPInterface
 
-    image_path = None
+    conn = None
     stage = "preparing the OTA request"
     try:
-        with tempfile.NamedTemporaryFile(prefix="meshtastic-ota-", suffix=".bin", delete=False) as image:
-            image.write(data)
-            image_path = image.name
-        updater = ota.ESP32WiFiOTA(image_path, target)
+        image_hash = hashlib.sha256(data).hexdigest()
         if iface is None:
             stage = "opening a bounded Meshtastic TCP/4403 session"
             iface = TCPInterface(
@@ -291,7 +312,7 @@ def unified_ota_upload(target, data, iface=None):
         stage = "sending the Wi-Fi OTA reboot request over TCP/4403"
         iface.localNode.startOTA(
             ota_mode=admin_pb2.OTAMode.OTA_WIFI,
-            ota_file_hash=updater.hash_bytes(),
+            ota_file_hash=bytes.fromhex(image_hash),
         )
         # startOTA makes the node drop TCP while it reboots. Close our control
         # socket immediately so the Meshtastic client's heartbeat/reconnect
@@ -301,41 +322,51 @@ def unified_ota_upload(target, data, iface=None):
         finally:
             iface = None
         stage = "connecting to the node's Wi-Fi OTA service on TCP/3232"
-        time.sleep(5)
-        for attempt in range(10):
+        deadline = time.monotonic() + 45
+        while True:
             try:
-                stage = f"transferring the image over TCP/3232 (attempt {attempt + 1}/10)"
-                updater.update()
-                return {"message": f"Unified Wi-Fi OTA completed for {target}. The node verified the image and should reboot."}
-            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as error:
-                raise RuntimeError(
-                    "The node reset the TCP/3232 OTA connection before acknowledging the image header. "
-                    "On ESP32-S3 boards this can indicate the older OTA Loader v1.0.1 stack-overflow bug; "
-                    "the loader may need a one-time USB update. The node rebooted back to normal firmware; "
-                    "do not repeat the OTA attempt until the loader is updated."
-                ) from error
-            except TimeoutError as error:
-                raise RuntimeError(
-                    "The node accepted the OTA reboot request, but the Wi-Fi OTA service did not answer on TCP/3232 in time. "
-                    "The image transfer could not be confirmed. Do not retry until the node is back online; on ESP32-S3, "
-                    "check the OTA loader over USB before another Wi-Fi update."
-                ) from error
-            except Exception as error:
-                # Only retry when the OTA service is not reachable yet. Once a
-                # transfer starts, any failure is terminal: restarting the OTA
-                # handshake could interrupt a partially written image.
-                if attempt < 9 and isinstance(error, OSError) and error.errno in {
-                    errno.ECONNREFUSED,
-                    errno.ENETUNREACH,
-                    errno.EHOSTUNREACH,
-                }:
-                    time.sleep(2)
-                    continue
-                raise RuntimeError(
-                    f"Unified Wi-Fi OTA failed during {stage}: {error}. "
-                    "The firmware transfer was not retried automatically. Check that the node returned to Wi-Fi; "
-                    "if it stays offline, inspect or repair its OTA loader over USB before trying again."
-                ) from error
+                conn = socket.create_connection((target, 3232), timeout=3)
+                break
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "TCP/3232 never accepted a connection within 45 seconds; "
+                        f"last connection error: {error}"
+                    ) from error
+                print(f"[ota] TCP/3232 is not ready at {target}; retrying before sending image ({error})", flush=True)
+                time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+        stage = "sending the OTA image header and waiting for the loader's erase/ready response"
+        conn.settimeout(30)
+        conn.sendall(f"OTA {len(data)} {image_hash}\n".encode("ascii"))
+        while True:
+            response = _ota_read_line(conn, 120, "waiting for the loader's ERASING/OK response")
+            print(f"[ota] Loader at {target}: {response}", flush=True)
+            if response == "ERASING":
+                continue
+            if response == "OK":
+                break
+            if response.startswith("ERR "):
+                raise RuntimeError(f"The OTA loader rejected the image before transfer: {response}")
+            print(f"[ota] Unexpected OTA handshake response: {response!r}", flush=True)
+
+        stage = "streaming the image over TCP/3232"
+        conn.settimeout(60)
+        sent = 0
+        while sent < len(data):
+            block = data[sent:sent + 1024]
+            conn.sendall(block)
+            sent += len(block)
+            if sent == len(data) or sent % (256 * 1024) < 1024:
+                print(f"[ota] Sent {sent}/{len(data)} firmware bytes to {target}", flush=True)
+
+        stage = "waiting for the loader to verify the image and acknowledge completion"
+        response = _ota_read_line(conn, 180, "waiting for final image verification")
+        if response != "OK":
+            if response.startswith("ERR "):
+                raise RuntimeError(f"The OTA loader rejected the transferred image: {response}")
+            raise RuntimeError(f"Unexpected final OTA response from the loader: {response!r}")
+        return {"message": f"Unified Wi-Fi OTA completed for {target}. The loader verified the image and acknowledged the update."}
     except (ValueError, RuntimeError):
         raise
     except BrokenPipeError as error:
@@ -347,17 +378,44 @@ def unified_ota_upload(target, data, iface=None):
             ) from error
         raise RuntimeError(f"Unified Wi-Fi OTA failed while {stage}: {error}") from error
     except Exception as error:
+        if isinstance(error, TimeoutError):
+            if stage == "connecting to the node's Wi-Fi OTA service on TCP/3232":
+                detail = (
+                    "TCP/3232 did not accept a connection within 45 seconds; the image header and image were not sent. "
+                    "Wait for the node to return to normal firmware before another attempt."
+                )
+            elif stage == "sending the OTA image header and waiting for the loader's erase/ready response":
+                detail = (
+                    "The loader connection opened, but no complete ERASING/OK response arrived within 120 seconds. "
+                    "The image bytes were not sent; wait for the node to return to normal firmware before another attempt."
+                )
+            elif stage == "streaming the image over TCP/3232":
+                detail = (
+                    "The loader accepted the image header, but sending the full image timed out. "
+                    "The transfer may be partial; wait for the node to return to normal firmware before another attempt."
+                )
+            elif stage == "waiting for the loader to verify the image and acknowledge completion":
+                detail = (
+                    "All image bytes were sent, but final verification was not acknowledged within 180 seconds. "
+                    "The result is unknown; wait for the node to return to normal firmware before another attempt."
+                )
+            else:
+                detail = f"The timeout occurred before the OTA image transfer, during {stage}."
+            raise RuntimeError(
+                f"Unified Wi-Fi OTA timed out while {stage}: {error}. "
+                f"{detail}"
+            ) from error
         raise RuntimeError(f"Unified Wi-Fi OTA failed while {stage}: {error}") from error
     finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
         if iface is not None:
             try:
                 iface.close()
             except Exception:
-                pass
-        if image_path:
-            try:
-                os.unlink(image_path)
-            except OSError:
                 pass
 
 
