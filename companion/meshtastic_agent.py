@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local companion for Meshtastic OTA Studio. Python 3.10+, standard library only."""
 import argparse
+from contextlib import contextmanager
 import errno
 import hashlib
 import hmac
@@ -15,6 +16,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 import tempfile
 import zipfile
@@ -24,9 +26,11 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
+DEVICE_OPERATIONS = {}
+DEVICE_OPERATIONS_LOCK = threading.Lock()
 MAX_REQUEST = 120 * 1024 * 1024
 MAX_IMAGE = 24 * 1024 * 1024
 ESP32S3_OTA_LOADER_SIZE = 636_496
@@ -45,6 +49,36 @@ def private_ipv4(value):
     if ip.version != 4 or not ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
         raise ValueError("Enter a private IPv4 address on the same LAN as this computer.")
     return str(ip)
+
+
+class DeviceBusyError(RuntimeError):
+    """A second operation must not interrupt a node's current connection."""
+
+
+@contextmanager
+def device_operation(transport, target, action):
+    # Do not queue commands: a delayed OTA/apply request could unexpectedly run
+    # after the user has moved on. The caller can retry when the node is free.
+    if transport == "tcp":
+        address = private_ipv4(target)
+    elif transport == "usb":
+        address = os.path.realpath(target)
+    else:
+        address = str(target).lower()
+    key = (transport, address)
+    with DEVICE_OPERATIONS_LOCK:
+        current = DEVICE_OPERATIONS.get(key)
+        if current:
+            raise DeviceBusyError(
+                f"Companion is already {current} on {target}. "
+                "Wait for that operation to finish, then retry."
+            )
+        DEVICE_OPERATIONS[key] = action
+    try:
+        yield
+    finally:
+        with DEVICE_OPERATIONS_LOCK:
+            DEVICE_OPERATIONS.pop(key, None)
 
 
 def firmware_options(blob, filename, board):
@@ -1112,7 +1146,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 query = parse_qs(route.query)
                 ip = query.get("ip", [""])[0]
-                self.send_json(200, identify_meshtastic(ip))
+                with device_operation("tcp", ip, "reading device identity"):
+                    identity = identify_meshtastic(ip)
+                self.send_json(200, identity)
+            except DeviceBusyError as error:
+                self.send_json(409, {"error": str(error), "code": "device_busy"})
             except (ValueError, RuntimeError) as error:
                 self.send_json(400, {"error": str(error)})
         elif route.path == "/api/usb/ports":
@@ -1123,14 +1161,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif route.path == "/api/usb/identify":
             try:
                 port = parse_qs(route.query).get("port", [""])[0]
-                self.send_json(200, usb_meshtastic_identity(port))
+                with device_operation("usb", port, "reading device identity"):
+                    identity = usb_meshtastic_identity(port)
+                self.send_json(200, identity)
+            except DeviceBusyError as error:
+                self.send_json(409, {"error": str(error), "code": "device_busy"})
             except (ValueError, RuntimeError) as error:
                 self.send_json(400, {"error": str(error)})
         elif route.path == "/api/usb/ota-loader/status":
             try:
                 port = parse_qs(route.query).get("port", [""])[0]
                 manual_boot = parse_qs(route.query).get("manual", [""])[0] == "1"
-                self.send_json(200, inspect_esp32s3_ota_loader(port, manual_boot))
+                with device_operation("usb", port, "checking the OTA loader"):
+                    status = inspect_esp32s3_ota_loader(port, manual_boot)
+                self.send_json(200, status)
+            except DeviceBusyError as error:
+                self.send_json(409, {"error": str(error), "code": "device_busy"})
             except (ValueError, RuntimeError) as error:
                 self.send_json(400, {"error": str(error)})
         elif route.path == "/api/bluetooth/scan":
@@ -1142,11 +1188,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 query = parse_qs(route.query)
                 transport, target = query.get("transport", [""])[0], query.get("target", [""])[0]
-                iface = open_device(transport, target)
-                try:
-                    self.send_json(200, device_configuration(iface))
-                finally:
-                    iface.close()
+                with device_operation(transport, target, "reading device settings"):
+                    iface = open_device(transport, target)
+                    try:
+                        config = device_configuration(iface)
+                    finally:
+                        iface.close()
+                self.send_json(200, config)
+            except DeviceBusyError as error:
+                self.send_json(409, {"error": str(error), "code": "device_busy"})
             except Exception as error:
                 self.send_json(400, {"error": str(error)})
         else:
@@ -1189,25 +1239,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 results = []
                 for target in request.get("targets", []):
                     transport, address = target.get("transport", ""), target.get("target", "")
-                    iface = None
                     try:
-                        iface = open_device(transport, address)
-                        writes = apply_configuration(iface, request)
+                        with device_operation(transport, address, "applying device settings"):
+                            iface = open_device(transport, address)
+                            try:
+                                writes = apply_configuration(iface, request)
+                            finally:
+                                try:
+                                    iface.close()
+                                except Exception:
+                                    pass
                         results.append({"target": address, "transport": transport, "ok": True, "written": writes})
                     except Exception as error:
                         results.append({"target": address, "transport": transport, "ok": False, "error": str(error)})
-                    finally:
-                        if iface is not None:
-                            try:
-                                iface.close()
-                            except Exception:
-                                pass
                 self.send_json(200, {"results": results})
                 return
             fields = self.parse_form()
             filename, blob = fields.get("firmware", ("", b""))
             if self.path == "/api/usb/repair-ota-loader":
-                result = repair_esp32s3_ota_loader(fields.get("port", ""), blob, fields.get("manual_boot") == "1")
+                port = fields.get("port", "")
+                with device_operation("usb", port, "repairing the OTA loader"):
+                    result = repair_esp32s3_ota_loader(port, blob, fields.get("manual_boot") == "1")
                 self.send_json(200, result)
                 return
             if self.path == "/api/firmware/options":
@@ -1217,10 +1269,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.path == "/api/update":
                 target = private_ipv4(fields.get("ip", ""))
                 image = read_firmware(blob, filename, fields.get("member", ""))
-                result = ota_upload(target, image, fields.get("password", ""), fields.get("member") or filename)
+                with device_operation("tcp", target, "updating firmware"):
+                    result = ota_upload(target, image, fields.get("password", ""), fields.get("member") or filename)
                 self.send_json(200, result)
                 return
             self.send_json(404, {"error": "Unknown local companion route."})
+        except DeviceBusyError as error:
+            self.send_json(409, {"error": str(error), "code": "device_busy"})
         except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as error:
             self.send_json(400, {"error": str(error)})
 
