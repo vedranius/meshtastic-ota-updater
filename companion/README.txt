@@ -66,7 +66,7 @@ commita 02e63d9; nije službeno označeno izdanje. Opće firmware flashanje prek
 USB-a/Bluetootha nije podržano.
 
 
-Update note: use companion agent v0.3.8 or newer. It adds USB identity and partition/loader inspection for the standalone repair, fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
+Update note: use companion agent v0.3.9 or newer. It adds USB identity and partition/loader inspection for the standalone repair, fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
 If an ESP32-S3 node closes the TCP/3232 connection after the image header and
 reboots, its older Wi-Fi OTA loader may need a one-time USB update before OTA
 can work again. Do not repeatedly retry if the agent reports a loader reset.

@@ -23,7 +23,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.3.8"
+VERSION = "0.3.9"
 MAX_REQUEST = 120 * 1024 * 1024
 MAX_IMAGE = 24 * 1024 * 1024
 ESP32S3_OTA_LOADER_SIZE = 636_496
@@ -561,7 +561,25 @@ def list_serial_ports():
         from serial.tools import list_ports
     except ImportError as error:
         raise RuntimeError("USB support is unavailable. Restart the agent so it can install the Meshtastic package.") from error
-    return [{"path": p.device, "name": p.description or p.device, "hwid": p.hwid or ""} for p in list_ports.comports()]
+    ports = []
+    for port in list_ports.comports():
+        path = port.device or ""
+        description = port.description or ""
+        hwid = port.hwid or ""
+        # Linux exposes many unconnected motherboard UARTs as ttyS devices.
+        # They are not USB candidates and probing them creates noisy failures.
+        if re.fullmatch(r"/dev/ttyS\d+", path):
+            continue
+        usb_candidate = (
+            port.vid is not None
+            or port.pid is not None
+            or any(token in (description + " " + hwid).lower() for token in ("usb", "uart", "cdc"))
+            or re.search(r"(?:/dev/tty(?:USB|ACM)|/dev/cu\.|^COM\d+$)", path, re.IGNORECASE)
+        )
+        if not usb_candidate:
+            continue
+        ports.append({"path": path, "name": description or path, "hwid": hwid})
+    return ports
 
 
 def usb_meshtastic_identity(port, timeout=12):
