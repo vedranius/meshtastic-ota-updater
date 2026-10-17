@@ -4,8 +4,10 @@ Potreban je Python 3.10 ili noviji. Prvo pokretanje automatski stvara privatni
 Python okoliš i instalira Meshtastic Python biblioteku i esptool 5+ za USB pristup,
 prepoznavanje uređaja te ciljani popravak OTA loadera.
 
-Windows: dvoklik na start-windows.bat, pa zalijepite URL Pages stranice.
-Linux/macOS: pokrenite ./start-linux-macos.sh https://vas-projekt.pages.dev
+Windows: dvoklik na start-windows.bat. Pritisnite Enter za zadanu stranicu
+https://meshtastic-ota-updater.pages.dev/ ili unesite drugi URL.
+Linux/macOS: pokrenite ./start-linux-macos.sh i pritisnite Enter za zadanu
+stranicu; drugi URL možete zadati kao argument.
 
 Ostavite prozor agenta otvoren tijekom ažuriranja. Zadano sluša samo na
 127.0.0.1:8765. Ako preglednik zatraži dozvolu za pristup lokalnoj ili loopback mreži, dopusti je za domenu Pages; bez te dozvole javna HTTPS stranica ne može pozvati localhost agenta. Za identifikaciju uređaja agent se povezuje na Meshtastic TCP
@@ -22,7 +24,7 @@ Agent na drugom računalu ili serveru
 Remote binding zahtijeva HTTPS certifikat, ključ i pristupni token. Na serveru,
 nakon prvog pokretanja i dependency setupa, pokreni:
 
-  .venv/bin/python meshtastic_agent.py --origin https://meshtastic-ota-updater.pages.dev --bind 0.0.0.0 --token 'DUGI-TAJNI-TOKEN-OD-NAJMANJE-24-ZNAKA' --certfile /putanja/agent.crt --keyfile /putanja/agent.key
+  .venv/bin/python meshtastic_agent.py --bind 0.0.0.0 --token 'DUGI-TAJNI-TOKEN-OD-NAJMANJE-24-ZNAKA' --certfile /putanja/agent.crt --keyfile /putanja/agent.key
 
 Na Windowsu koristi .venv\Scripts\python.exe. U pregledniku unesi HTTPS URL
 servera i isti token. Certifikat mora biti valjan i preglednik ga mora

@@ -2,7 +2,8 @@
 setlocal
 cd /d "%~dp0"
 if "%~1"=="" (
-  set /p PAGE_ORIGIN=Enter your Cloudflare Pages origin (https://your-project.pages.dev): 
+  set /p PAGE_ORIGIN=Cloudflare Pages URL [https://meshtastic-ota-updater.pages.dev/]:
+  if not defined PAGE_ORIGIN set "PAGE_ORIGIN=https://meshtastic-ota-updater.pages.dev"
 ) else (
   set PAGE_ORIGIN=%~1
 )

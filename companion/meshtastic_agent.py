@@ -23,7 +23,8 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
+DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 MAX_REQUEST = 120 * 1024 * 1024
 MAX_IMAGE = 24 * 1024 * 1024
@@ -1149,7 +1150,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Local Meshtastic Wi-Fi OTA companion")
-    parser.add_argument("--origin", required=True, help="Exact Cloudflare Pages origin, e.g. https://my-project.pages.dev")
+    parser.add_argument("--origin", default=DEFAULT_ORIGIN, help=f"Exact Cloudflare Pages origin (default: {DEFAULT_ORIGIN})")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--bind", default="127.0.0.1", help="Bind address; keep 127.0.0.1 for local-only use")
     parser.add_argument("--token", default="", help="Required for remote agents; use at least 24 random characters")

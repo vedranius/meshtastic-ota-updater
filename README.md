@@ -26,8 +26,8 @@ The app does not require a database, Cloudflare secret, or binding. Release meta
 
 Python 3.10 or newer is required. The included starter script creates a private virtual environment and installs the official `meshtastic` Python package on first run.
 
-- Windows: double-click `companion/start-windows.bat` and enter the Pages origin.
-- Linux/macOS: run `./companion/start-linux-macos.sh https://your-project.pages.dev`.
+- Windows: double-click `companion/start-windows.bat` and press Enter to use `https://meshtastic-ota-updater.pages.dev/` as the default (or enter another Pages origin).
+- Linux/macOS: run `./companion/start-linux-macos.sh` and press Enter to use the default page; pass another Pages origin as an argument to override it.
 
 Keep the terminal open during identification and flashing. Local mode binds only to `127.0.0.1:8765` and accepts requests only from the exact Pages origin given at startup.
 
@@ -37,7 +37,6 @@ The agent supports a remote LAN endpoint using HTTPS and a bearer token. First r
 
 ```sh
 .venv/bin/python meshtastic_agent.py \
-  --origin https://meshtastic-ota-updater.pages.dev \
   --bind 0.0.0.0 --port 8765 \
   --token 'replace-with-a-random-secret-at-least-24-characters' \
   --certfile /path/to/agent.crt --keyfile /path/to/agent.key

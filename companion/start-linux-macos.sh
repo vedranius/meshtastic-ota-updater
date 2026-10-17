@@ -6,8 +6,9 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 if [ "$#" -lt 1 ]; then
-  printf 'Unesi točan URL svoje Cloudflare Pages stranice (npr. https://my-meshtastic.pages.dev): '
+  printf 'URL Cloudflare Pages stranice [https://meshtastic-ota-updater.pages.dev/]: '
   IFS= read -r page_origin
+  page_origin=${page_origin:-https://meshtastic-ota-updater.pages.dev}
 else
   page_origin=$1
 fi
