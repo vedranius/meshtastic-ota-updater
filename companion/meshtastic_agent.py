@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local companion for Meshtastic OTA Studio. Python 3.10+, standard library only."""
 import argparse
+import errno
 import hashlib
 import hmac
 import http.server
@@ -23,7 +24,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 MAX_REQUEST = 120 * 1024 * 1024
@@ -244,7 +245,16 @@ def unified_ota_upload(target, data):
             image.write(data)
             image_path = image.name
         updater = ota.ESP32WiFiOTA(image_path, target)
-        iface = TCPInterface(hostname=target, portNumber=4403)
+        stage = "opening a bounded Meshtastic TCP/4403 session"
+        iface = TCPInterface(
+            hostname=target,
+            portNumber=4403,
+            timeout=15,
+            noNodes=True,
+            connectNow=False,
+        )
+        iface.connect()
+        stage = "sending the Wi-Fi OTA reboot request over TCP/4403"
         iface.localNode.startOTA(
             ota_mode=admin_pb2.OTAMode.OTA_WIFI,
             ota_file_hash=updater.hash_bytes(),
@@ -258,10 +268,9 @@ def unified_ota_upload(target, data):
             iface = None
         stage = "connecting to the node's Wi-Fi OTA service on TCP/3232"
         time.sleep(5)
-        last_error = None
-        for attempt in range(5):
+        for attempt in range(10):
             try:
-                stage = f"transferring the image over TCP/3232 (attempt {attempt + 1}/5)"
+                stage = f"transferring the image over TCP/3232 (attempt {attempt + 1}/10)"
                 updater.update()
                 return {"message": f"Unified Wi-Fi OTA completed for {target}. The node verified the image and should reboot."}
             except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError) as error:
@@ -272,12 +281,31 @@ def unified_ota_upload(target, data):
                     "do not repeat the OTA attempt until the loader is updated."
                 ) from error
             except Exception as error:
-                last_error = error
-                if attempt < 4:
+                # Only retry when the OTA service is not reachable yet. Once a
+                # transfer starts, any failure is terminal: restarting the OTA
+                # handshake could interrupt a partially written image.
+                if attempt < 9 and isinstance(error, OSError) and error.errno in {
+                    errno.ECONNREFUSED,
+                    errno.ENETUNREACH,
+                    errno.EHOSTUNREACH,
+                }:
                     time.sleep(2)
-        raise RuntimeError(f"Unified Wi-Fi OTA {stage} failed after 5 attempts: {last_error}")
+                    continue
+                raise RuntimeError(
+                    f"Unified Wi-Fi OTA failed during {stage}: {error}. "
+                    "The firmware transfer was not retried automatically. Check that the node returned to Wi-Fi; "
+                    "if it stays offline, inspect or repair its OTA loader over USB before trying again."
+                ) from error
     except (ValueError, RuntimeError):
         raise
+    except BrokenPipeError as error:
+        if "sending the Wi-Fi OTA reboot request" in stage:
+            raise RuntimeError(
+                "The node closed its Meshtastic TCP/4403 connection while the Wi-Fi OTA reboot request was being sent. "
+                "The request may have reached the node; check whether it rebooted and returned to Wi-Fi before retrying. "
+                "If it stays offline, inspect or repair the OTA loader over USB."
+            ) from error
+        raise RuntimeError(f"Unified Wi-Fi OTA failed while {stage}: {error}") from error
     except Exception as error:
         raise RuntimeError(f"Unified Wi-Fi OTA failed while {stage}: {error}") from error
     finally:
@@ -855,18 +883,37 @@ def scan_bluetooth():
     return [{"address": d.address, "name": d.name or d.address} for d in devices]
 
 
-def open_device(transport, target):
+def open_device(transport, target, timeout=20):
     """Open one explicitly selected Meshtastic device using the official client library."""
     if transport == "tcp":
         target = private_ipv4(target)
         from meshtastic.tcp_interface import TCPInterface
-        return TCPInterface(hostname=target, portNumber=4403)
+        iface = TCPInterface(
+            hostname=target,
+            portNumber=4403,
+            timeout=timeout,
+            noNodes=True,
+            connectNow=False,
+        )
+        try:
+            iface.connect()
+            return iface
+        except Exception as error:
+            try:
+                iface.close()
+            except Exception:
+                pass
+            detail = str(error).strip() or error.__class__.__name__
+            raise RuntimeError(
+                f"Could not open a Meshtastic settings session with {target} on TCP/4403: {detail}. "
+                "Check that the node is online, TCP access is enabled, and no other client is holding its connection."
+            ) from error
     if transport == "usb":
         from meshtastic.serial_interface import SerialInterface
         paths = {item["path"] for item in list_serial_ports()}
         if target not in paths:
             raise ValueError("That USB port is not currently available. Refresh the USB device list.")
-        return SerialInterface(devPath=target)
+        return SerialInterface(devPath=target, timeout=timeout, noNodes=True)
     if transport == "bluetooth":
         if not re.fullmatch(r"[0-9A-Fa-f:_-]{12,20}", str(target)):
             raise ValueError("Select a Bluetooth device from the scan results.")
