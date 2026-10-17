@@ -23,7 +23,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 MAX_REQUEST = 120 * 1024 * 1024
@@ -414,7 +414,7 @@ def dns_name(data, offset):
             raise ValueError("Invalid mDNS label.")
         labels.append(data[cursor + 1:cursor + 1 + length].decode("utf-8", "replace"))
         cursor += 1 + length
-    return ".".join(labels).lower(), end if end is not None else cursor
+    return ".".join(labels), end if end is not None else cursor
 
 
 def discover_meshtastic(interface_ip, timeout=2.5):
@@ -488,14 +488,20 @@ def discover_meshtastic(interface_ip, timeout=2.5):
     finally:
         sock.close()
 
-    instances = {r["target"] for r in records if r["type"] == 12 and r["name"] == service}
+    instances = {r["target"] for r in records if r["type"] == 12 and r["name"].lower() == service}
     found = []
     for instance in instances:
-        srv = next((r for r in records if r["type"] == 33 and r["name"] == instance), None)
-        txt = next((r.get("txt", []) for r in records if r["type"] == 16 and r["name"] == instance), [])
+        srv = next((r for r in records if r["type"] == 33 and r["name"].lower() == instance.lower()), None)
+        txt = next((r.get("txt", []) for r in records if r["type"] == 16 and r["name"].lower() == instance.lower()), [])
+        txt_map = {}
+        for entry in txt:
+            if "=" in entry:
+                key, value = entry.split("=", 1)
+                txt_map[key.strip().lower()] = value.strip()
+        advertised_name = next((txt_map[key] for key in ("longname", "long_name", "name", "hostname", "device_name") if txt_map.get(key)), "")
         host = srv["target"] if srv else ""
-        address = next((r["address"] for r in records if r["type"] == 1 and r["name"] == host), "")
-        peer = next((r["peer"] for r in records if r["name"] == instance), "")
+        address = next((r["address"] for r in records if r["type"] == 1 and r["name"].lower() == host.lower()), "")
+        peer = next((r["peer"] for r in records if r["name"].lower() == instance.lower()), "")
         ip = address or peer
         try:
             ip = private_ipv4(ip)
@@ -503,7 +509,7 @@ def discover_meshtastic(interface_ip, timeout=2.5):
             continue
         if ipaddress.ip_address(ip) not in network:
             continue
-        found.append({"ip": ip, "name": instance.rstrip("."), "host": host.rstrip("."), "port": srv.get("port") if srv else None, "txt": txt, "service": service})
+        found.append({"ip": ip, "name": advertised_name, "serviceName": instance.rstrip("."), "host": host.rstrip("."), "port": srv.get("port") if srv else None, "txt": txt, "service": service})
     unique = {item["ip"]: item for item in found}
     return list(unique.values())
 
@@ -533,7 +539,7 @@ def identify_meshtastic(target, timeout=5):
         metadata = metadata or {}
         hw_model = user.get("hwModel") or user.get("hw_model")
         if not hw_model and not user and not metadata:
-            raise RuntimeError("Port 4403 answered, but the node did not provide identity metadata. Enable Meshtastic TCP on this device or choose its board manually.")
+            raise RuntimeError("The TCP port answered, but the node did not provide identity metadata. Enable Meshtastic TCP on this device or choose its board manually.")
         if hasattr(metadata, "firmware_version"):
             firmware = metadata.firmware_version
         elif isinstance(metadata, dict):
@@ -549,7 +555,7 @@ def identify_meshtastic(target, timeout=5):
             "verified": bool(hw_model),
         }
     except (OSError, TimeoutError) as error:
-        raise RuntimeError("Could not read Meshtastic identity over TCP port 4403. Confirm the selected IP, same LAN, and that TCP access is enabled: " + str(error))
+        raise RuntimeError(f"Could not read Meshtastic identity over TCP port 4403. Confirm the selected IP, same LAN, and that TCP access is enabled: {error}")
     finally:
         if iface is not None:
             try:
@@ -1034,7 +1040,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(500, {"error": "Local mDNS discovery failed: " + str(error)})
         elif route.path == "/api/identify":
             try:
-                ip = parse_qs(route.query).get("ip", [""])[0]
+                query = parse_qs(route.query)
+                ip = query.get("ip", [""])[0]
                 self.send_json(200, identify_meshtastic(ip))
             except (ValueError, RuntimeError) as error:
                 self.send_json(400, {"error": str(error)})

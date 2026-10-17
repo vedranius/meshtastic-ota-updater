@@ -11,7 +11,7 @@ stranicu; drugi URL možete zadati kao argument.
 
 Ostavite prozor agenta otvoren tijekom ažuriranja. Zadano sluša samo na
 127.0.0.1:8765. Ako preglednik zatraži dozvolu za pristup lokalnoj ili loopback mreži, dopusti je za domenu Pages; bez te dozvole javna HTTPS stranica ne može pozvati localhost agenta. Za identifikaciju uređaja agent se povezuje na Meshtastic TCP
-port 4403; taj port mora biti dostupan s računala agenta.
+port 4403; taj port mora biti dostupan s računala agenta. mDNS pretraga svaki put prikazuje samo nove rezultate; zatim agent preko Meshtastic TCP/4403 pokušava očitati naziv, model pločice i verziju firmwarea. Povijest ranije pronađenih uređaja prikazuje se odvojeno.
 
 Za firmware 2.7.18+ agent šalje OTA zahtjev preko Meshtastic TCP/4403; nod se
 zatim ponovno pokrene u OTA loader, a agent šalje sliku nodu preko TCP/3232. Za
@@ -68,7 +68,7 @@ commita 02e63d9; nije službeno označeno izdanje. Opće firmware flashanje prek
 USB-a/Bluetootha nije podržano.
 
 
-Update note: use companion agent v0.4.0 or newer. It adds USB identity and partition/loader inspection for the standalone repair, fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
+Update note: use companion agent v0.4.2 or newer. It adds USB identity and partition/loader inspection for the standalone repair, fixes protobuf config reads, registers POST requests, and uses official Unified OTA for firmware 2.7.18+ with legacy fallback.
 If an ESP32-S3 node closes the TCP/3232 connection after the image header and
 reboots, its older Wi-Fi OTA loader may need a one-time USB update before OTA
 can work again. Do not repeatedly retry if the agent reports a loader reset.
