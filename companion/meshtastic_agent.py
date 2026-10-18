@@ -26,7 +26,7 @@ from io import BytesIO
 from pathlib import PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.4.8"
+VERSION = "0.4.9"
 DEFAULT_ORIGIN = "https://meshtastic-ota-updater.pages.dev"
 USB_IDENTITY_CACHE = {}
 DEVICE_OPERATIONS = {}

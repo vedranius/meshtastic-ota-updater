@@ -9,6 +9,15 @@ https://meshtastic-ota-updater.pages.dev/ ili unesite drugi URL.
 Linux/macOS: pokrenite ./start-linux-macos.sh i pritisnite Enter za zadanu
 stranicu; drugi URL možete zadati kao argument.
 
+ChromeOS Chromebook: omogućite Linux development environment u Postavke > O
+ChromeOS-u > Razvojni programeri > Linux development environment. Na stranici
+aplikacije odaberite „ChromeOS / Chromebook” i kopirajte ponuđenu naredbu u
+aplikaciju Terminal. Ona instalira potrebne Debian pakete, preuzima Companion,
+priprema Python okoliš i pokreće agenta za ovu Pages stranicu. Ostavite Terminal
+otvoren. Za Wi-Fi OTA koristite IP uređaja ako automatsko mDNS pretraživanje ne
+pronađe nod. USB popravak radi samo ako ChromeOS može proslijediti baš taj USB
+serijski uređaj Linuxu; nisu svi USB uređaji podržani.
+
 Ostavite prozor agenta otvoren tijekom ažuriranja. Zadano sluša samo na
 127.0.0.1:8765. Ako preglednik zatraži dozvolu za pristup lokalnoj ili loopback mreži, dopusti je za domenu Pages; bez te dozvole javna HTTPS stranica ne može pozvati localhost agenta. Za identifikaciju uređaja agent se povezuje na Meshtastic TCP
 port 4403; taj port mora biti dostupan s računala agenta. mDNS pretraga svaki put prikazuje samo nove rezultate; zatim agent preko Meshtastic TCP/4403 pokušava očitati naziv, model pločice i verziju firmwarea. Povijest ranije pronađenih uređaja prikazuje se odvojeno.
@@ -73,7 +82,7 @@ USB oporavak prethodnog firmwarea
 
 Ako Wi-Fi OTA zahtjev pokrene loader, ali TCP/3232 nikad ne postane dostupan, ne pokušavaj ponovno OTA. U aplikaciji odaberi „Pronađi USB port bez identifikacije” da ROM downloader ne otvaramo kao Meshtastic serijsku vezu. Za Heltec Wireless Tracker drži BOOT/USER, kratko pritisni i pusti RESET, zatim pusti BOOT/USER. Provjera preko ROM-a odbija rad ako Secure Boot/flash encryption nisu potvrđeno isključeni, ako stvarna particijska tablica nema podržani app0/app1/otadata raspored ili ako app0 nema ESP image header. Tek nakon izričite potvrde briše se samo stvarna otadata particija i čita natrag radi provjere. Firmware app0 i NVS/postavke se ne zapisuju. Nakon uspjeha pritisni RESET za pokretanje prethodnog app0 firmwarea.
 
-Update note: use companion agent v0.4.8 or newer. Version 0.4.8 adds guarded previous-firmware recovery via ROM mode; it only erases and verifies OTA selection metadata after checking chip security, app0 header, and the actual partition map. It does not flash app0 or write NVS. Version 0.4.7 replaced the upstream library’s blanket 15-second Wi-Fi OTA socket timeout with separate deadlines: 45 seconds for the loader to accept TCP/3232, 120 seconds for the ERASING/ready handshake, and 180 seconds for final verification. The agent logs loader responses and transfer progress, reports which OTA phase timed out, and never retries after sending the OTA image header. It retains v0.4.6 protections: USB loader inspection and repair, bounded Meshtastic TCP sessions, and one operation per device/transport, including configuration reads/writes, USB checks, and the entire OTA transfer. Conflicting requests return HTTP 409 instead of opening a second connection; commands are never queued.
+Update note: use companion agent v0.4.9 or newer. Version 0.4.9 adds a ChromeOS-specific setup command and launcher for the Chromebook Linux environment. USB support depends on whether ChromeOS passes the specific serial device through to Linux. Version 0.4.8 adds guarded previous-firmware recovery via ROM mode; it only erases and verifies OTA selection metadata after checking chip security, app0 header, and the actual partition map. It does not flash app0 or write NVS. Version 0.4.7 replaced the upstream library’s blanket 15-second Wi-Fi OTA socket timeout with separate deadlines: 45 seconds for the loader to accept TCP/3232, 120 seconds for the ERASING/ready handshake, and 180 seconds for final verification. The agent logs loader responses and transfer progress, reports which OTA phase timed out, and never retries after sending the OTA image header. It retains v0.4.6 protections: USB loader inspection and repair, bounded Meshtastic TCP sessions, and one operation per device/transport, including configuration reads/writes, USB checks, and the entire OTA transfer. Conflicting requests return HTTP 409 instead of opening a second connection; commands are never queued.
 If an ESP32-S3 node closes the TCP/3232 connection after the image header and
 reboots, its older Wi-Fi OTA loader may need a one-time USB update before OTA
 can work again. Do not repeatedly retry if the agent reports a loader reset.
